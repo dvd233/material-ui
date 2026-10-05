@@ -1,0 +1,421 @@
+# DRAFT ONLY. Do not publish without explicit authorization of destination/run.
+# Reconcile TEST_FILES and exact source SHA with the implementation owner's final patch.
+# Planned destination: public dvd233/material-ui fork, isolated validation branch.
+# The validation commit must be a direct child of the reviewed feature commit and
+# add only this workflow. Insert that immutable feature SHA below before push.
+name: MUI 22648 source-bound browser proof
+on:
+  push:
+    branches:
+      - ci/autocomplete-inline-completion-20261005-v4
+permissions:
+  contents: read
+jobs:
+  browser-proof:
+    if: github.repository == 'dvd233/material-ui'
+    name: ${{ matrix.phase }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - phase: red-base
+            timeout: 60
+          - phase: green-fix
+            timeout: 90
+    env:
+      CI: 'true'
+      FIXED_SHA: 31385d4a500748f042bf78c327aca0d332695c4f
+      VALIDATION_SHA: ${{ github.sha }}
+      BASE_SHA: daaa525c3af0bd99329da1f1ab0d2bd64648ea79
+      PHASE: ${{ matrix.phase }}
+      # Names reconciled to the implementation draft on 2026-10-05.
+      # The source keeps its meaningful inline-completion assertion diagnostic.
+      TEST_FILES: >-
+        test/e2e/index.test.ts
+        test/e2e/fixtures/Autocomplete/InlineCompletion.tsx
+      REGRESSION_TEST: completes growing prefixes without committing the completion
+      CONTROL_TEST: "[Material Autocomplete] should highlight correct option when initial navigation through options starts from mouse move"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Verify fixed source and construct reviewed baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep checkout and shell under the hosted runner's legitimate owner.
+          # Fail on an unexpected ownership mismatch instead of widening Git trust.
+          id
+          printf 'HOME=%s\nGITHUB_WORKSPACE=%s\n' "$HOME" "$GITHUB_WORKSPACE"
+          stat -c '%u:%g %a %n' "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.git"
+          test "$(stat -c '%u' "$GITHUB_WORKSPACE")" = "$(id -u)"
+          test "$(stat -c '%u' "$GITHUB_WORKSPACE/.git")" = "$(id -u)"
+          [[ "$FIXED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$VALIDATION_SHA"
+          test "$(git rev-list --parents -n 1 "$VALIDATION_SHA" | wc -w)" -eq 2
+          test "$(git rev-parse "$VALIDATION_SHA^")" = "$FIXED_SHA"
+          test "$(git diff --name-only "$FIXED_SHA" "$VALIDATION_SHA")" = '.github/workflows/mui-22648-proof.yml'
+          git merge-base --is-ancestor "$BASE_SHA" "$FIXED_SHA"
+          git checkout --detach "$FIXED_SHA"
+          test "$(git rev-parse HEAD)" = "$FIXED_SHA"
+          git diff --exit-code "$BASE_SHA" "$FIXED_SHA" -- package.json pnpm-lock.yaml pnpm-workspace.yaml
+          mkdir -p evidence
+          printf 'phase=%s\nbase=%s\nfixed=%s\n' "$PHASE" "$BASE_SHA" "$FIXED_SHA" | tee evidence/source.txt
+          if [ "$PHASE" = red-base ]; then
+            git checkout --detach "$BASE_SHA"
+            for path in $TEST_FILES; do
+              mkdir -p "$(dirname "$path")"
+              git show "$FIXED_SHA:$path" > "$path"
+            done
+            # Require the implementation to be pristine base. The full test-only
+            # diff must be reviewed before approving this workflow's run.
+            git diff --exit-code "$BASE_SHA" -- packages vitest.shared.mts test/e2e/vite.config.mts
+          fi
+          sha256sum packages/mui-material/src/useAutocomplete/useAutocomplete.js $TEST_FILES | tee evidence/hashes.txt
+          git status --short | tee evidence/status.txt
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 12.8.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.3'
+      - name: Install frozen dependencies
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          pnpm --version
+          pnpm install --frozen-lockfile
+          pnpm exec playwright --version
+          git diff --exit-code -- package.json pnpm-lock.yaml pnpm-workspace.yaml
+      - name: Install pinned Playwright browsers and operating-system dependencies
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(pnpm exec playwright --version)" = 'Version 1.63.0'
+          if [ "$PHASE" = red-base ]; then
+            pnpm exec playwright install --with-deps chromium 2>&1 | tee evidence/browser-install.log
+          else
+            pnpm exec playwright install --with-deps chromium firefox webkit 2>&1 | tee evidence/browser-install.log
+          fi
+      - name: Prepare isolated validation reporters
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/mui-red-runtime-reporter.mjs" <<'RUNTIME_REPORTER'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          
+          // Companion to Vitest 5's JSON reporter, which does not serialize unhandledErrors.
+          // This reporter is validation tooling only; it does not modify the MUI tests.
+          export default class RedRuntimeReporter {
+            timedOut = false;
+          
+            onInit(context) {
+              this.output = process.env.GATE_RUNTIME_REPORT;
+              this.runId = process.env.GATE_RUN_ID;
+              if (!this.output || !this.runId) {
+                throw new Error('GATE_RUNTIME_REPORT and GATE_RUN_ID are required');
+              }
+              this.vitestVersion = context.version;
+              fs.mkdirSync(path.dirname(this.output), { recursive: true });
+              fs.rmSync(this.output, { force: true });
+            }
+          
+            onProcessTimeout() {
+              this.timedOut = true;
+              // Vitest can call this after onTestRunEnd has already persisted the report.
+              // Invalidate it so a close timeout cannot be mistaken for a clean red run.
+              if (this.output) fs.rmSync(this.output, { force: true });
+            }
+          
+            onTestRunEnd(modules, unhandledErrors, reason) {
+              const serialize = (errors) => errors.map((error) => ({
+                name: error.name ?? '',
+                message: error.message ?? '',
+                stack: error.stack ?? '',
+              }));
+              const report = {
+                schemaVersion: 1,
+                runId: this.runId,
+                vitestVersion: this.vitestVersion,
+                reason,
+                timedOut: this.timedOut,
+                unhandledErrors: serialize(unhandledErrors),
+                modules: modules.map((module) => ({
+                  name: module.moduleId,
+                  state: module.state(),
+                  errors: serialize(module.errors()),
+                  suites: [...module.children.allSuites()].map((suite) => ({
+                    name: suite.fullName,
+                    errors: serialize(suite.errors()),
+                  })),
+                })),
+              };
+              fs.writeFileSync(this.output, `${JSON.stringify(report, null, 2)}\n`);
+            }
+          }
+          RUNTIME_REPORTER
+          cat > "$RUNNER_TEMP/mui-verify-red-report.mjs" <<'RED_VERIFIER'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          
+          const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const runtime = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+          const runnerLog = fs.readFileSync(process.argv[4], 'utf8');
+          // Some close/teardown errors occur after onTestRunEnd and are logged by Vitest's
+          // close() path without reaching any final reporter callback.
+          assert.doesNotMatch(runnerLog, /error during close|close timed out|startup error|unhandled (?:errors?|rejection|exception)/i, 'Late close or unhandled runtime error is not regression proof');
+          const expectedRunId = process.env.GATE_RUN_ID;
+          assert.ok(expectedRunId, 'GATE_RUN_ID is required to bind the runtime report to this run');
+          assert.equal(runtime.schemaVersion, 1, 'Unexpected runtime reporter schema');
+          assert.equal(runtime.runId, expectedRunId, 'Stale or unrelated runtime report');
+          assert.equal(runtime.vitestVersion, '5.0.0', 'Revalidate this gate if Vitest changes');
+          assert.equal(runtime.reason, 'failed', 'Expected a completed failed baseline run');
+          assert.equal(runtime.timedOut, false, 'Process timeout is not regression proof');
+          assert.deepEqual(runtime.unhandledErrors, [], 'Unhandled runtime errors are not regression proof');
+          assert.equal(runtime.modules?.length, 1, 'Expected one runtime-reported E2E module');
+          assert.equal(report.testResults?.length, 1, 'Expected one JSON-reported E2E module');
+          const file = report.testResults[0];
+          assert.match(file.name, /(?:^|\/)test\/e2e\/index\.test\.ts$/, 'Wrong E2E test module');
+          assert.equal(file.status, 'failed', 'Expected the E2E module to fail');
+          assert.equal(file.message, '', 'Module-level setup/teardown error is not regression proof');
+          const module = runtime.modules[0];
+          assert.equal(module.name, file.name, 'JSON and runtime reports refer to different modules');
+          assert.equal(module.state, 'failed', 'Expected the runtime E2E module to fail');
+          assert.deepEqual(module.errors, [], 'Module-level hook/collection error is not regression proof');
+          assert.ok(Array.isArray(module.suites), 'Missing suite error inventory');
+          for (const suite of module.suites) {
+            assert.deepEqual(suite.errors, [], `Suite hook error is not regression proof: ${suite.name}`);
+          }
+          
+          const expected = {
+            regression: {
+              title: 'completes growing prefixes without committing the completion',
+              ancestorTitles: ['e2e', '<Autocomplete/>', 'automatic inline completion'],
+              status: 'failed',
+            },
+            control: {
+              title: '[Material Autocomplete] should highlight correct option when initial navigation through options starts from mouse move',
+              ancestorTitles: ['e2e', '<Autocomplete/>'],
+              status: 'passed',
+            },
+          };
+          const results = file.assertionResults;
+          assert.ok(Array.isArray(results), 'Missing test assertion results');
+          const matched = Object.fromEntries(Object.entries(expected).map(([kind, required]) => {
+            const matches = results.filter((result) => result.title === required.title);
+            assert.equal(matches.length, 1, `Expected exactly one ${kind} test`);
+            const result = matches[0];
+            assert.deepEqual(result.ancestorTitles, required.ancestorTitles, `Wrong ${kind} suite`);
+            assert.equal(result.fullName, [...required.ancestorTitles, required.title].join(' '), `Wrong ${kind} full title`);
+            assert.equal(result.status, required.status, `Wrong ${kind} result`);
+            return [kind, result];
+          }));
+          for (const result of results) {
+            if (result !== matched.regression && result !== matched.control) {
+              assert.ok(['skipped', 'todo'].includes(result.status), `Unexpected executed/incomplete test: ${result.fullName}`);
+            }
+            if (result !== matched.regression) {
+              assert.deepEqual(result.failureMessages, [], `Unexpected error on ${result.fullName}`);
+            }
+          }
+          assert.equal(matched.regression.failureMessages.length, 1, 'Exactly one intended assertion error is required');
+          const failureText = matched.regression.failureMessages[0].replace(/\u001b\[[0-9;]*m/g, '');
+          assert.match(failureText, /the highlighted option should appear inline/, 'Wrong assertion diagnostic');
+          assert.match(failureText, /toHaveValue/, 'Expected the input-value matcher to fail');
+          assert.match(failureText, /^Expected(?: string)?:\s*"Andorra"\s*$/m, 'Expected value must be Andorra');
+          assert.match(failureText, /^Received(?: string)?:\s*"a"\s*$/m, 'Received value must be the raw typed a');
+          assert.equal(report.numFailedTests, 1, 'Unexpected failed test count');
+          assert.equal(report.numPassedTests, 1, 'Unexpected passed test count');
+          assert.equal(report.success, false, 'Baseline unexpectedly passed');
+          // numFailedTestSuites includes describe ancestors in Vitest 5, so do not use it
+          // as an error count. The required runtime sidecar catches errors omitted by JSON.
+          console.log('Validated expected red: exact native-browser completion assertion failed; the existing control passed; no hook or unhandled runtime errors.');
+          RED_VERIFIER
+          sha256sum "$RUNNER_TEMP/mui-red-runtime-reporter.mjs" "$RUNNER_TEMP/mui-verify-red-report.mjs" | tee evidence/gate-hashes.txt
+      - name: Build source-bound full-component fixtures
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_ENV=production pnpm -F ./test/e2e build 2>&1 | tee evidence/build.log
+      - name: Run actual browser editing regression
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -F ./test/e2e server > evidence/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          node --input-type=module <<'NODE'
+          const deadline = Date.now() + 30000;
+          while (true) {
+            try {
+              const response = await fetch('http://localhost:5001', { signal: AbortSignal.timeout(1000) });
+              if (response.ok) break;
+            } catch {}
+            if (Date.now() >= deadline) throw new Error('E2E fixture server did not start');
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          NODE
+          export GATE_RUN_ID="${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${PHASE}:${FIXED_SHA}"
+          export GATE_RUNTIME_REPORT="$GITHUB_WORKSPACE/evidence/e2e-runtime.json"
+          if [ "$PHASE" = red-base ]; then
+            rm -f evidence/e2e-red.json evidence/e2e-runtime.json evidence/e2e-red.log
+            TEST_PATTERN=$(node -e 'process.stdout.write([process.env.REGRESSION_TEST, process.env.CONTROL_TEST].map(value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"))')
+            set +e
+            pnpm -F ./test/e2e test -t "$TEST_PATTERN" --testTimeout 15000 \
+              --reporter=default --reporter=json --reporter="$RUNNER_TEMP/mui-red-runtime-reporter.mjs" \
+              --outputFile="$GITHUB_WORKSPACE/evidence/e2e-red.json" \
+              2>&1 | tee evidence/e2e-red.log
+            RESULT=${PIPESTATUS[0]}
+            set -e
+            test "$RESULT" -ne 0
+            node "$RUNNER_TEMP/mui-verify-red-report.mjs" evidence/e2e-red.json evidence/e2e-runtime.json evidence/e2e-red.log
+          else
+            pnpm -F ./test/e2e test --testTimeout 15000 --reporter=default --reporter=json \
+              --outputFile="$GITHUB_WORKSPACE/evidence/e2e-green.json" \
+              2>&1 | tee evidence/e2e-green.log
+          fi
+      - name: Run affected unit tests in three real browser engines
+        if: matrix.phase == 'green-fix'
+        timeout-minutes: 15
+        shell: bash
+        env:
+          VITEST_BROWSERS: chromium,firefox,webkit
+        run: |
+          set -euo pipefail
+          pnpm test:browser run Autocomplete --project 'browser:@mui/material*' \
+            --no-isolate --no-file-parallelism --reporter=default --reporter=json \
+            --outputFile=evidence/browser-green.json 2>&1 | tee evidence/browser-green.log
+      - name: Run affected JSDOM unit tests
+        if: matrix.phase == 'green-fix'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm test:node run Autocomplete --project 'node:@mui/material' \
+            --no-isolate --no-file-parallelism --reporter=default --reporter=json \
+            --outputFile=evidence/node-green.json 2>&1 | tee evidence/node-green.log
+      - name: Print evidence even on failure
+        if: always()
+        shell: bash
+        run: |
+          git diff --exit-code -- packages/mui-material/src/useAutocomplete/useAutocomplete.js
+          cat evidence/source.txt evidence/hashes.txt evidence/status.txt || true
+          for report in evidence/*json; do test ! -f "$report" || cat "$report"; done
+          cat evidence/server.log || true
+  aggregate-checks:
+    if: github.repository == 'dvd233/material-ui'
+    name: aggregate-${{ matrix.check }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: format
+            timeout: 20
+          - check: lint
+            timeout: 30
+          - check: typescript
+            timeout: 60
+          - check: unit
+            timeout: 90
+    env:
+      CI: 'true'
+      FIXED_SHA: 31385d4a500748f042bf78c327aca0d332695c4f
+      VALIDATION_SHA: ${{ github.sha }}
+      BASE_SHA: daaa525c3af0bd99329da1f1ab0d2bd64648ea79
+      CHECK: ${{ matrix.check }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Verify source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep checkout and shell under the hosted runner's legitimate owner.
+          # Fail on an unexpected ownership mismatch instead of widening Git trust.
+          id
+          printf 'HOME=%s\nGITHUB_WORKSPACE=%s\n' "$HOME" "$GITHUB_WORKSPACE"
+          stat -c '%u:%g %a %n' "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.git"
+          test "$(stat -c '%u' "$GITHUB_WORKSPACE")" = "$(id -u)"
+          test "$(stat -c '%u' "$GITHUB_WORKSPACE/.git")" = "$(id -u)"
+          [[ "$FIXED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$VALIDATION_SHA"
+          test "$(git rev-list --parents -n 1 "$VALIDATION_SHA" | wc -w)" -eq 2
+          test "$(git rev-parse "$VALIDATION_SHA^")" = "$FIXED_SHA"
+          test "$(git diff --name-only "$FIXED_SHA" "$VALIDATION_SHA")" = '.github/workflows/mui-22648-proof.yml'
+          git merge-base --is-ancestor "$BASE_SHA" "$FIXED_SHA"
+          git checkout --detach "$FIXED_SHA"
+          test "$(git rev-parse HEAD)" = "$FIXED_SHA"
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source.txt
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 12.8.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.3'
+      - name: Install complete workspace from frozen lockfile
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee evidence/install.log
+          git diff --exit-code -- package.json pnpm-lock.yaml pnpm-workspace.yaml
+      - name: Install Chromium for the full default unit suite
+        if: matrix.check == 'unit'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(pnpm exec playwright --version)" = 'Version 1.63.0'
+          pnpm exec playwright install --with-deps chromium 2>&1 | tee evidence/browser-install.log
+      - name: Run repository aggregate check
+        timeout-minutes: ${{ matrix.timeout }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CHECK" in
+            format)
+              # The documented formatter compares against local master. This
+              # disposable ref identifies the immutable reviewed base only.
+              git branch --force master "$BASE_SHA"
+              pnpm prettier 2>&1 | tee evidence/format.log
+              ;;
+            lint)
+              pnpm eslint 2>&1 | tee evidence/lint.log
+              ;;
+            typescript)
+              # Upstream's documented CI equivalent of pnpm typescript:
+              # all workspace TypeScript projects, with concurrency limited to 3.
+              pnpm typescript:ci 2>&1 | tee evidence/typescript.log
+              ;;
+            unit)
+              # TEST_SCOPE intentionally unset: the repository default includes
+              # every node project and Chromium browser project. No name filter.
+              pnpm test:unit run --no-isolate --no-file-parallelism 2>&1 | tee evidence/unit.log
+              ;;
+          esac
+          git diff --exit-code
+      - name: Show source and any tracked changes
+        if: always()
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git status --short
+          git diff --stat
